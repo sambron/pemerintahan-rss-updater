@@ -1,0 +1,146 @@
+name: Fetch Pemerintahan RSS (12 Sumber + Keywords Editable)
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # tiap 2 jam
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install feedparser requests beautifulsoup4
+
+      - name: Fetch keywords dari KV + scrape 12 sumber
+        env:
+          RSS_KV_URL: https://pemerintahan-rss.sambroni.workers.dev/?format=json
+        run: |
+          cat > fetch.py << 'PY'
+          import feedparser, requests, json, re, datetime
+          from bs4 import BeautifulSoup
+
+          # 1. AMBIL KEYWORDS DARI KV (yang kamu edit di /?format=html)
+          try:
+            r = requests.get("https://pemerintahan-rss.sambroni.workers.dev/?format=json", timeout=15)
+            j = r.json()
+            KEYWORDS = [k.lower() for k in j.get("keywords", ["pemerintahan"])]
+            print(f"Keywords dari KV: {KEYWORDS}")
+          except Exception as e:
+            print(f"Gagal ambil keywords, pakai default: {e}")
+            KEYWORDS = ["pemerintahan","pemerintah","kementerian","presiden","dpr","menteri","istana","kabinet","apbn","prabowo","gibran"]
+
+          # 2. DAFTAR 12 SUMBER (6 resmi + 6 media nasional)
+          SOURCES = [
+            # Sumber resmi (tanpa filter keyword - semua masuk)
+            {"name":"setkab","url":"https://setkab.go.id/feed/","cat":"setkab","filter":False},
+            {"name":"setneg","url":"https://www.setneg.go.id/rss","cat":"setneg","filter":False},
+            {"name":"kemenkeu","url":"https://www.kemenkeu.go.id/feed","cat":"kemenkeu","filter":False},
+            {"name":"dpr","url":"https://www.dpr.go.id/rss","cat":"dpr","filter":False},
+
+            # Media nasional (FILTER pakai keywords - hanya berita pemerintahan)
+            {"name":"detik","url":"https://news.detik.com/rss/index.php/detikcom","cat":"detik","filter":True},
+            {"name":"kompas","url":"https://www.kompas.com/rss/nasional","cat":"kompas","filter":True},
+            {"name":"tribun","url":"https://www.tribunnews.com/nasional/rss","cat":"tribun","filter":True},
+            {"name":"jpnn","url":"https://www.jpnn.com/rss","cat":"jpnn","filter":True},
+            {"name":"jawapos","url":"https://www.jawapos.com/nasional/feed","cat":"jawapos","filter":True},
+            {"name":"mnc","url":"https://www.mnctrijaya.com/rss","cat":"mnc","filter":True},
+            {"name":"okezone","url":"https://nasional.okezone.com/rss","cat":"okezone","filter":True},
+            {"name":"antaranews","url":"https://www.antaranews.com/rss/nasional","cat":"antaranews","filter":True},
+          ]
+
+          def contains_kw(text):
+            t = (text or "").lower()
+            return any(k in t for k in KEYWORDS)
+
+          all_items=[]
+          for src in SOURCES:
+            try:
+              print(f"Fetching {src['name']} - {src['url']}")
+              resp = requests.get(src['url'], timeout=20, headers={"User-Agent":"Mozilla/5.0 PEMERINTAHAN.ID"})
+              feed = feedparser.parse(resp.content)
+              for e in feed.entries[:15]:
+                title = e.get('title','').strip()
+                link = e.get('link','')
+                desc = e.get('description','') or e.get('summary','')
+                if src['filter']:
+                  if not contains_kw(title+" "+desc):
+                    continue
+
+                # image
+                img=""
+                if 'media_content' in e and e.media_content:
+                  img = e.media_content[0].get('url','')
+                if not img and 'enclosures' in e and e.enclosures:
+                  img = e.enclosures[0].get('href','')
+                if not img:
+                  try:
+                    soup=BeautifulSoup(desc,'html.parser')
+                    imgtag=soup.find('img')
+                    if imgtag: img=imgtag.get('src','')
+                  except: pass
+
+                # auto kategori lebih detail
+                cat = src['cat']
+                low = (title+" "+desc).lower()
+                if "kemenkeu" in low or "apbn" in low: cat="kemenkeu"
+                elif "setkab" in low: cat="setkab"
+                elif "setneg" in low or "istana" in low: cat="setneg"
+                elif "dpr" in low: cat="dpr"
+                elif "asn" in low or "pns" in low: cat="asn"
+                elif "komdigi" in low: cat="komdigi"
+
+                all_items.append({
+                  "title": title,
+                  "link": link,
+                  "description": BeautifulSoup(desc,'html.parser').get_text()[:250],
+                  "pub_date": e.get('published','') or datetime.datetime.utcnow().isoformat(),
+                  "image": img,
+                  "source": src['name'],
+                  "category": cat
+                })
+            except Exception as ex:
+              print(f"  Error {src['name']}: {ex}")
+
+          # deduplicate
+          seen=set(); uniq=[]
+          for it in all_items:
+            if it['link'] not in seen:
+              seen.add(it['link']); uniq.append(it)
+
+          # sort terbaru dulu
+          uniq = uniq[:60]
+          data={"last_updated": datetime.datetime.utcnow().isoformat()+"Z", "total": len(uniq), "items": uniq, "keywords": KEYWORDS}
+          with open('pemerintahan-rss.json','w',encoding='utf-8') as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+          print(f"TOTAL {len(uniq)} berita disimpan - keywords: {KEYWORDS}")
+          PY
+          python fetch.py
+
+      - name: Upload ke Cloudflare KV
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ]; then echo "Set secrets dulu di GitHub Settings"; exit 0; fi
+          curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/pemerintahan-rss" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @pemerintahan-rss.json
+          echo "Upload OK"
+
+      - name: Commit json (backup)
+        run: |
+          git config --global user.name "bot"
+          git config --global user.email "bot@pemerintahan.id"
+          git add pemerintahan-rss.json || true
+          git commit -m "update rss $(date)" || true
+          git push || true
