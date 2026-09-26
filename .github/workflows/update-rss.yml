@@ -20,9 +20,11 @@ jobs:
           CF_NAMESPACE_ID: ${{ secrets.CF_NAMESPACE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
-          if [ -f ".github/scripts/update_kv.py" ]; then
-            python .github/scripts/update_kv.py
-          else
-            echo "Cari di folder dobel..."
-            python pemerintahan-rss-updater/.github/scripts/update_kv.py
+          FILE=$(find . -type f -name "update_kv.py" | head -n 1)
+          echo "File ditemukan di: $FILE"
+          if [ -z "$FILE" ]; then
+            echo "ERROR: update_kv.py tidak ditemukan di mana pun!"
+            ls -R
+            exit 1
           fi
+          python "$FILE"
